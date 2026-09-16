@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+#===============================================================================
+# brew-new — list Homebrew formulae/casks ADDED in a time window, brew-style.
+#
+#   ==> New Formulae
+#   name: description
+#   ==> New Casks
+#   token: description
+#
+# Homebrew has no built-in "recently added" command. Names come from the git
+# history of the homebrew-core / homebrew-cask taps — diffing two REAL commits
+# (tip vs. the last commit before the window); a plain shallow clone makes every
+# file look "added" at the graft boundary, so we avoid that. Descriptions come
+# from the official JSON API (formulae.brew.sh) — the same source brew uses.
+#
+# Deps: git, curl, awk/sed/sort/grep. jq only for --json. No brew required.
+# Portable: macOS + Linux (git parses "N weeks ago" itself; no date(1) needed).
+#===============================================================================
+set -euo pipefail
+
+VERSION="1.1.0"
+PERIOD="30d"
+WHICH="all"          # all | formulae | casks
+FILTER=""            # optional regex over names
+FORMAT="brew"        # brew | names | dates | json | csv
+REFRESH=0
+GIT_TTL=21600        # tap clone freshness: 6h
+API_TTL=86400        # description cache freshness: 24h
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/brew-new"
+prog=${0##*/}
+
+usage() {
+  cat <<EOF
+$prog $VERSION — Homebrew formulae/casks added in a time window (brew-style).
+
+USAGE
+  $prog [PERIOD] [options]
+
+PERIOD
+  A number with an optional unit: 7d, 2w, 3mo, 1y  (bare number = days).
+  Default: $PERIOD. Also settable with -p/--period or --days N.
+
+OPTIONS
+  -p, --period P     time window (7d | 2w | 3mo | 1y)
+  -d, --days N       time window in days
+  -f, --formulae     only formulae (homebrew-core)
+  -c, --casks        only casks (homebrew-cask)
+  -a, --all          both (default)
+  -g, --filter RE    keep only names matching regex RE (case-insensitive)
+      --names        just the names (no descriptions), column layout
+      --dates        append the date each entry was added
+      --json         emit JSON  [{name,type,date,desc}]
+      --csv          emit CSV   name,type,date,desc
+  -r, --refresh      force fresh clone + description refresh
+  -h, --help         this help
+  -v, --version      print version
+
+EXAMPLES
+  $prog                      # brew-style, last 30 days
+  $prog 2w -c                # casks from the last 2 weeks
+  $prog 3mo -g 'ai|mcp|agent'
+  $prog 1y --csv > new.csv
+
+Cache: $CACHE
+EOF
+}
+die() { printf '%s: %s\n' "$prog" "$*" >&2; exit 1; }
+
+# ---- args --------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--period)   PERIOD="${2:?}"; shift 2 ;;
+    -d|--days)     PERIOD="${2:?}d"; shift 2 ;;
+    -f|--formulae) WHICH="formulae"; shift ;;
+    -c|--casks)    WHICH="casks"; shift ;;
+    -a|--all)      WHICH="all"; shift ;;
+    -g|--filter)   FILTER="${2:?}"; shift 2 ;;
+    --names)       FORMAT="names"; shift ;;
+    --dates)       FORMAT="dates"; shift ;;
+    --json)        FORMAT="json"; shift ;;
+    --csv)         FORMAT="csv"; shift ;;
+    -r|--refresh)  REFRESH=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    -v|--version)  echo "$prog $VERSION"; exit 0 ;;
+    -*)            die "unknown option: $1 (try --help)" ;;
+    *)             PERIOD="$1"; shift ;;   # bare positional period
+  esac
+done
+
+# ---- period -> git "since" string + buffer days ------------------------------
+if [[ "$PERIOD" =~ ^([0-9]+)(d|w|mo|m|y)?$ ]]; then
+  num=${BASH_REMATCH[1]}; unit=${BASH_REMATCH[2]:-d}
+  case "$unit" in
+    d)     SINCE="$num days ago";   BDAYS=$num ;;
+    w)     SINCE="$num weeks ago";  BDAYS=$((num*7)) ;;
+    mo|m)  SINCE="$num months ago"; BDAYS=$((num*31)) ;;
+    y)     SINCE="$num years ago";  BDAYS=$((num*366)) ;;
+  esac
+else die "bad period: '$PERIOD' (use 7d, 2w, 3mo, 1y)"; fi
+
+command -v git  >/dev/null || die "git is required"
+command -v curl >/dev/null || die "curl is required"
+[ "$FORMAT" = json ] && ! command -v jq >/dev/null && die "--json needs jq"
+mkdir -p "$CACHE"
+CLONE_SINCE="$((BDAYS + 45)) days ago"   # clone deeper than the window
+fresh() { [ -n "$(find "$1" -mmin -$(( $2 / 60 )) 2>/dev/null)" ]; }
+
+# ---- keep/refresh a blobless clone of one tap --------------------------------
+ensure_clone() {
+  local repo=$1 dest="$CACHE/$1" stamp="$CACHE/$1/.stamp"
+  if [ "$REFRESH" = 1 ] || [ ! -d "$dest/.git" ] || ! fresh "$stamp" "$GIT_TTL"; then
+    rm -rf "$dest"
+    git clone -q --filter=blob:none --shallow-since="$CLONE_SINCE" \
+      "https://github.com/Homebrew/$repo" "$dest" || die "clone failed: $repo (network?)"
+    : > "$stamp"
+  fi
+}
+
+# ---- cache the API name->desc TSV (reduced from the big JSON) -----------------
+desc_file() {
+  local kind=$1 api=$2 key=$3
+  local out="$CACHE/$kind.desc.tsv"
+  if [ "$REFRESH" = 1 ] || ! fresh "$out" "$API_TTL"; then
+    curl -fsS "https://formulae.brew.sh/api/$api.json" 2>/dev/null \
+      | jq -r --arg k "$key" '.[]|[.[$k],(.desc//"")]|@tsv' > "$out.tmp" 2>/dev/null \
+      && mv "$out.tmp" "$out" || : > "$out"   # degrade to empty on failure
+  fi
+  printf '%s' "$out"
+}
+
+# ---- emit "name<TAB>type<TAB>date" rows for one tap --------------------------
+scan_tap() {
+  local repo=$1 dir=$2 type=$3 dest="$CACHE/$1"
+  ensure_clone "$repo"
+  local OLD; OLD=$(git -C "$dest" rev-list -1 --before="$SINCE" HEAD 2>/dev/null || true)
+  [ -z "$OLD" ] && return 0
+  local added
+  added=$(git -C "$dest" diff --diff-filter=A --name-only "$OLD" HEAD -- "$dir/" 2>/dev/null \
+          | grep -E '\.rb$' | grep -oE '[^/]+\.rb$' | sed 's/\.rb$//' | sort -u) || true
+  [ -z "$added" ] && return 0
+  local map; map=$(git -C "$dest" log --reverse "$OLD..HEAD" --diff-filter=A \
+        --date=short --pretty=format:'@%cd' --name-only -- "$dir/" 2>/dev/null \
+    | awk '/^@/{d=substr($0,2);next} /\.rb$/{n=$0;sub(/.*\//,"",n);sub(/\.rb$/,"",n);if(!(n in s))s[n]=d}
+           END{for(n in s)print n"\t"s[n]}')
+  printf '%s\n' "$added" | while IFS= read -r n; do
+    [ -z "$n" ] && continue
+    [ -n "$FILTER" ] && { printf '%s' "$n" | grep -qiE "$FILTER" || continue; }
+    printf '%s\t%s\t%s\n' "$n" "$type" "$(printf '%s\n' "$map" | awk -F'\t' -v n="$n" '$1==n{print $2;exit}')"
+  done
+}
+
+# ---- gather rows (name\ttype\tdate) ------------------------------------------
+# NB: append the newline OUTSIDE $(...) — command substitution strips trailing
+# newlines, so otherwise the last formula row glues onto the first cask row.
+rows=""
+if [ "$WHICH" != casks ];    then rows+="$(scan_tap homebrew-core Formula formula)"$'\n'; fi
+if [ "$WHICH" != formulae ]; then rows+="$(scan_tap homebrew-cask Casks cask)"$'\n'; fi
+rows=$(printf '%s' "$rows" | sed '/^$/d')
+
+# ---- attach descriptions (skip for --names) ----------------------------------
+if [ "$FORMAT" != names ] && [ -n "$rows" ]; then
+  fdesc=$(desc_file formula formula name); cdesc=$(desc_file cask cask token)
+  { sed 's/^/formula\t/' "$fdesc"; sed 's/^/cask\t/' "$cdesc"; } > "$CACHE/.alldesc"
+  rows=$(awk -F'\t' 'NR==FNR{d[$1"\t"$2]=$3;next}{print $0"\t"d[$2"\t"$1]}' "$CACHE/.alldesc" <(printf '%s\n' "$rows"))
+fi
+
+nf=$(printf '%s\n' "$rows" | awk -F'\t' '$2=="formula"' | grep -c . || true)
+nc=$(printf '%s\n' "$rows" | awk -F'\t' '$2=="cask"'    | grep -c . || true)
+
+# ---- output ------------------------------------------------------------------
+emit_group() { # $1=type $2=header
+  local body; body=$(printf '%s\n' "$rows" | awk -F'\t' -v t="$1" -v dt="$SHOWDATE" '
+    $2==t{ line=$1; if($4!="")line=line": "$4; if(dt=="1"&&$3!="")line=line"  ("$3")"; print line }' | sort)
+  [ -z "$body" ] && return 0
+  printf '==> %s\n%s\n' "$2" "$body"
+}
+SHOWDATE=0
+case "$FORMAT" in
+  json)
+    printf '%s\n' "$rows" | jq -R -s -c 'split("\n")|map(select(length>0)|split("\t")
+      |{name:.[0],type:.[1],date:(.[2]//""),desc:(.[3]//"")})' ;;
+  csv)
+    echo "name,type,date,desc"
+    printf '%s\n' "$rows" | awk -F'\t' 'NF{gsub(/"/,"\"\"",$4);print $1","$2","$3",\""$4"\""}' ;;
+  names)
+    cols() { command -v column >/dev/null && column -c "${COLUMNS:-100}" || cat; }
+    [ "$WHICH" != casks ]    && { echo "==> New Formulae ($nf)"; printf '%s\n' "$rows" | awk -F'\t' '$2=="formula"{print $1}' | sort | cols; }
+    [ "$WHICH" = all ]       && echo
+    [ "$WHICH" != formulae ] && { echo "==> New Casks ($nc)"; printf '%s\n' "$rows" | awk -F'\t' '$2=="cask"{print $1}' | sort | cols; } ;;
+  dates) SHOWDATE=1 ;&
+  brew|*)
+    [ "$WHICH" != casks ]    && emit_group formula "New Formulae"
+    { [ "$WHICH" = all ] && [ "$nf" -gt 0 ] && [ "$nc" -gt 0 ]; } && echo
+    [ "$WHICH" != formulae ] && emit_group cask "New Casks"
+    [ $((nf+nc)) -eq 0 ] && echo "(nothing new in the last $PERIOD)" >&2 || true ;;
+esac
+exit 0
