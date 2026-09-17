@@ -22,6 +22,19 @@ tungsten-edge: Window-oriented taskbar that replaces the Dock
 
 ## Install
 
+### Homebrew (tap)
+
+```sh
+brew tap gutocarvalho/tap https://gitlab.gutocarvalho.net/open/homebrew-tap.git
+brew trust gutocarvalho/tap
+brew install brew-new
+```
+
+`brew trust` is required once because Homebrew 7+ won't load formulae from a
+third-party tap until you trust it.
+
+### Manual
+
 It's a single Bash script. Drop it on your `PATH`:
 
 ```sh
