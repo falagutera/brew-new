@@ -13,19 +13,24 @@
 # file look "added" at the graft boundary, so we avoid that. Descriptions come
 # from the official JSON API (formulae.brew.sh) — the same source brew uses.
 #
-# Deps: git, curl, awk/sed/sort/grep. jq only for --json. No brew required.
-# Portable: macOS + Linux (git parses "N weeks ago" itself; no date(1) needed).
+# --oss keeps only open-source entries: formulae by their SPDX license (from the
+# API), casks by the license of their GitHub repo (casks carry no license field).
+#
+# Deps: git, curl, jq, awk/sed/sort/grep. No brew required.
+# Portable: macOS + Linux (git parses "N weeks ago" itself; no date math needed).
 #===============================================================================
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PERIOD="30d"
 WHICH="all"          # all | formulae | casks
 FILTER=""            # optional regex over names
 FORMAT="brew"        # brew | names | dates | json | csv
+OSS=0                # 1 = only open-source entries
 REFRESH=0
 GIT_TTL=21600        # tap clone freshness: 6h
 API_TTL=86400        # description cache freshness: 24h
+LIC_TTL=2592000      # GitHub license cache freshness: 30d
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/brew-new"
 prog=${0##*/}
 
@@ -47,10 +52,11 @@ OPTIONS
   -c, --casks        only casks (homebrew-cask)
   -a, --all          both (default)
   -g, --filter RE    keep only names matching regex RE (case-insensitive)
+  -o, --oss          only open-source entries (see OPEN SOURCE below)
       --names        just the names (no descriptions), column layout
       --dates        append the date each entry was added
-      --json         emit JSON  [{name,type,date,desc}]
-      --csv          emit CSV   name,type,date,desc
+      --json         emit JSON  [{name,type,date,desc,license}]
+      --csv          emit CSV   name,type,date,desc,license
   -r, --refresh      force fresh clone + description refresh
   -h, --help         this help
   -v, --version      print version
@@ -60,6 +66,15 @@ EXAMPLES
   $prog 2w -c                # casks from the last 2 weeks
   $prog 3mo -g 'ai|mcp|agent'
   $prog 1y --csv > new.csv
+  $prog 2w -c --oss
+
+OPEN SOURCE (--oss)
+  Formulae: kept when their SPDX license is an open-source one (homebrew-core
+  requires that, so nearly all pass). Casks have no license in Homebrew, so the
+  license comes from the GitHub repo in the cask's url/homepage; casks without
+  a GitHub repo, or whose repo has no recognised open-source license, are left
+  out. GitHub lookups use \$GITHUB_TOKEN / \$GH_TOKEN or \`gh auth token\` when
+  available (anonymous: 60 requests/hour) and are cached for 30 days.
 
 Cache: $CACHE
 EOF
@@ -75,6 +90,7 @@ while [ $# -gt 0 ]; do
     -c|--casks)    WHICH="casks"; shift ;;
     -a|--all)      WHICH="all"; shift ;;
     -g|--filter)   FILTER="${2:?}"; shift 2 ;;
+    -o|--oss)      OSS=1; shift ;;
     --names)       FORMAT="names"; shift ;;
     --dates)       FORMAT="dates"; shift ;;
     --json)        FORMAT="json"; shift ;;
@@ -100,7 +116,7 @@ else die "bad period: '$PERIOD' (use 7d, 2w, 3mo, 1y)"; fi
 
 command -v git  >/dev/null || die "git is required"
 command -v curl >/dev/null || die "curl is required"
-[ "$FORMAT" = json ] && ! command -v jq >/dev/null && die "--json needs jq"
+command -v jq   >/dev/null || die "jq is required"
 mkdir -p "$CACHE"
 CLONE_SINCE="$((BDAYS + 45)) days ago"   # clone deeper than the window
 fresh() { [ -n "$(find "$1" -mmin -$(( $2 / 60 )) 2>/dev/null)" ]; }
@@ -116,13 +132,19 @@ ensure_clone() {
   fi
 }
 
-# ---- cache the API name->desc TSV (reduced from the big JSON) -----------------
+# ---- cache the API name->desc->extra TSV (reduced from the big JSON) ----------
+# extra = SPDX license for formulae, GitHub "owner/repo" (from url/homepage) for casks.
 desc_file() {
   local kind=$1 api=$2 key=$3
-  local out="$CACHE/$kind.desc.tsv"
+  local out="$CACHE/$kind.v2.tsv"
   if [ "$REFRESH" = 1 ] || ! fresh "$out" "$API_TTL"; then
     curl -fsS "https://formulae.brew.sh/api/$api.json" 2>/dev/null \
-      | jq -r --arg k "$key" '.[]|[.[$k],(.desc//"")]|@tsv' > "$out.tmp" 2>/dev/null \
+      | jq -r --arg k "$key" '.[]|[.[$k], (.desc//""|gsub("[\t\n]";" ")),
+          (if $k=="name" then (.license//"")
+           else ([(.url//""),(.homepage//"")]
+                 | map(capture("^https?://github\\.com/(?<o>[^/?#]+)/(?<r>[^/?#]+)")?)
+                 | if length>0 then "\(.[0].o)/\(.[0].r|sub("\\.git$";""))" else "" end)
+           end)]|@tsv' > "$out.tmp" 2>/dev/null \
       && mv "$out.tmp" "$out" || : > "$out"   # degrade to empty on failure
   fi
   printf '%s' "$out"
@@ -157,11 +179,81 @@ if [ "$WHICH" != casks ];    then rows+="$(scan_tap homebrew-core Formula formul
 if [ "$WHICH" != formulae ]; then rows+="$(scan_tap homebrew-cask Casks cask)"$'\n'; fi
 rows=$(printf '%s' "$rows" | sed '/^$/d')
 
-# ---- attach descriptions (skip for --names) ----------------------------------
-if [ "$FORMAT" != names ] && [ -n "$rows" ]; then
+# ---- GitHub license lookup for casks (only with --oss) ------------------------
+# Cache: "owner/repo<TAB>spdx<TAB>epoch"; spdx NONE = no repo/license, ? = lookup failed (not cached).
+gh_license() { # owner/repo -> "owner/repo<TAB>spdx"; token comes via $BN_TOKEN, never argv
+  local body code
+  body=$(mktemp)
+  code=$( { [ -n "${BN_TOKEN:-}" ] && printf 'header = "Authorization: Bearer %s"\n' "$BN_TOKEN"; } |
+          curl -sSL -K - -o "$body" -w '%{http_code}' -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$1" 2>/dev/null) || code=000
+  case "$code" in
+    200)     local id; id=$(jq -r '.license.spdx_id // "NONE"' "$body")
+             # NOASSERTION = a license file GitHub couldn't classify (dual licenses etc.):
+             # read the text and look for a well-known open-source license
+             [ "$id" = NOASSERTION ] && id=$(gh_license_text "$1")
+             printf '%s\t%s\n' "$1" "$id" ;;
+    404|451) printf '%s\tNONE\n' "$1" ;;
+    *)       printf '%s\t?\n' "$1" ;;
+  esac
+  rm -f "$body"
+}
+gh_license_text() { # owner/repo -> detected license or NOASSERTION
+  local text
+  text=$( { [ -n "${BN_TOKEN:-}" ] && printf 'header = "Authorization: Bearer %s"\n' "$BN_TOKEN"; } |
+          curl -fsSL -K - -H 'Accept: application/vnd.github.raw+json' \
+            "https://api.github.com/repos/$1/license" 2>/dev/null) || { echo NOASSERTION; return; }
+  if printf '%s' "$text" | grep -qiE 'commons clause|business source license|polyform|server side public license|elastic license|attribution-noncommercial|cc by-nc'; then
+    echo NOASSERTION
+  elif printf '%s' "$text" | grep -qiE 'permission is hereby granted, free of charge|mit license'; then echo detected:MIT
+  elif printf '%s' "$text" | grep -qiE 'apache license'; then echo detected:Apache
+  elif printf '%s' "$text" | grep -qiE 'gnu (affero |lesser )?general public license'; then echo detected:GPL
+  elif printf '%s' "$text" | grep -qiE 'mozilla public license'; then echo detected:MPL
+  elif printf '%s' "$text" | grep -qiE 'redistribution and use in source and binary forms'; then echo detected:BSD
+  elif printf '%s' "$text" | grep -qiE 'unlicense|isc license|open font license'; then echo detected:other-OSS
+  else echo NOASSERTION; fi
+}
+resolve_cask_licenses() { # $1 = rows file; cask col5 owner/repo -> SPDX id
+  local cache="$CACHE/github-license.tsv" now slugs todo
+  now=$(date +%s); touch "$cache"
+  slugs=$(awk -F'\t' '$2=="cask"&&$5!=""{print $5}' "$1" | sort -u)
+  todo=$(printf '%s\n' "$slugs" | awk -F'\t' -v now="$now" -v ttl="$LIC_TTL" \
+           'FILENAME==ARGV[1]{if(now-$3<ttl)ok[$1]=1;next} $0!=""&&!($0 in ok)' "$cache" -)
+  if [ -n "$todo" ]; then
+    BN_TOKEN=${GITHUB_TOKEN:-${GH_TOKEN:-}}
+    [ -z "$BN_TOKEN" ] && command -v gh >/dev/null && BN_TOKEN=$(gh auth token 2>/dev/null || true)
+    export BN_TOKEN; export -f gh_license gh_license_text
+    printf '%s\n' "$todo" | xargs -P 8 -I{} bash -c 'gh_license "$1"' _ {} > "$CACHE/.lic.new"
+    if grep -q $'\t?$' "$CACHE/.lic.new"; then
+      printf '%s: %s GitHub license lookup(s) failed (rate limit? set GITHUB_TOKEN); those casks are left out\n' \
+        "$prog" "$(grep -c $'\t?$' "$CACHE/.lic.new")" >&2
+    fi
+    awk -F'\t' -v now="$now" '$2!="?"{print $1"\t"$2"\t"now}' "$CACHE/.lic.new" >> "$cache"
+    awk -F'\t' '{l[$1]=$0} END{for(k in l)print l[k]}' "$cache" > "$cache.tmp" && mv "$cache.tmp" "$cache"
+  fi
+  awk -F'\t' 'BEGIN{OFS="\t"} FILENAME==ARGV[1]{l[$1]=$2;next}
+       $2=="cask"{$5=($5=="" ? "NONE" : (($5 in l) ? l[$5] : "?"))} {print}' "$cache" "$1"
+  rm -f "$CACHE/.lic.new"
+}
+
+# ---- attach descriptions + license (skipped for plain --names) ---------------
+# rows become name<TAB>type<TAB>date<TAB>desc<TAB>license
+if { [ "$FORMAT" != names ] || [ "$OSS" = 1 ]; } && [ -n "$rows" ]; then
   fdesc=$(desc_file formula formula name); cdesc=$(desc_file cask cask token)
   { sed 's/^/formula\t/' "$fdesc"; sed 's/^/cask\t/' "$cdesc"; } > "$CACHE/.alldesc"
-  rows=$(awk -F'\t' 'NR==FNR{d[$1"\t"$2]=$3;next}{print $0"\t"d[$2"\t"$1]}' "$CACHE/.alldesc" <(printf '%s\n' "$rows"))
+  printf '%s\n' "$rows" > "$CACHE/.rows"
+  awk -F'\t' 'NR==FNR{d[$1"\t"$2]=$3;x[$1"\t"$2]=$4;next}{k=$2"\t"$1;print $1"\t"$2"\t"$3"\t"d[k]"\t"x[k]}' \
+    "$CACHE/.alldesc" "$CACHE/.rows" > "$CACHE/.rows2"
+  if [ "$OSS" = 1 ]; then
+    resolve_cask_licenses "$CACHE/.rows2" > "$CACHE/.rows3"
+    # open source = has a license that isn't source-available/non-commercial/unknown
+    rows=$(awk -F'\t' '{l=$5} l!="" && l!="NONE" && l!="?" &&
+      l !~ /NOASSERTION|BUSL|SSPL|Elastic-|PolyForm|Commons-Clause|CC-BY-NC|-NC-|Proprietary/ &&
+      l != "LicenseRef-Homebrew-cannot-represent"' "$CACHE/.rows3")
+  else
+    rows=$(awk -F'\t' 'BEGIN{OFS="\t"} $2=="cask"{$5=""} {print}' "$CACHE/.rows2")   # cask license only with --oss
+  fi
+  rm -f "$CACHE/.rows" "$CACHE/.rows2" "$CACHE/.rows3"
 fi
 
 nf=$(printf '%s\n' "$rows" | awk -F'\t' '$2=="formula"' | grep -c . || true)
@@ -178,10 +270,10 @@ SHOWDATE=0
 case "$FORMAT" in
   json)
     printf '%s\n' "$rows" | jq -R -s -c 'split("\n")|map(select(length>0)|split("\t")
-      |{name:.[0],type:.[1],date:(.[2]//""),desc:(.[3]//"")})' ;;
+      |{name:.[0],type:.[1],date:(.[2]//""),desc:(.[3]//""),license:(.[4]//"")})' ;;
   csv)
-    echo "name,type,date,desc"
-    printf '%s\n' "$rows" | awk -F'\t' 'NF{gsub(/"/,"\"\"",$4);print $1","$2","$3",\""$4"\""}' ;;
+    echo "name,type,date,desc,license"
+    printf '%s\n' "$rows" | awk -F'\t' 'NF{gsub(/"/,"\"\"",$4);print $1","$2","$3",\""$4"\","$5}' ;;
   names)
     cols() { command -v column >/dev/null && column -c "${COLUMNS:-100}" || cat; }
     [ "$WHICH" != casks ]    && { echo "==> New Formulae ($nf)"; printf '%s\n' "$rows" | awk -F'\t' '$2=="formula"{print $1}' | sort | cols; }
@@ -192,6 +284,6 @@ case "$FORMAT" in
     [ "$WHICH" != casks ]    && emit_group formula "New Formulae"
     { [ "$WHICH" = all ] && [ "$nf" -gt 0 ] && [ "$nc" -gt 0 ]; } && echo
     [ "$WHICH" != formulae ] && emit_group cask "New Casks"
-    [ $((nf+nc)) -eq 0 ] && echo "(nothing new in the last $PERIOD)" >&2 || true ;;
+    [ $((nf+nc)) -eq 0 ] && echo "(nothing new in the last $PERIOD$([ "$OSS" = 1 ] && echo ', open source'))" >&2 || true ;;
 esac
 exit 0
