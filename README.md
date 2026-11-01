@@ -25,7 +25,7 @@ tungsten-edge: Window-oriented taskbar that replaces the Dock
 ### Homebrew (tap)
 
 ```sh
-brew tap gutocarvalho/tap https://gitlab.gutocarvalho.net/open/homebrew-tap.git
+brew tap gutocarvalho/tap https://gitlab.gutocarvalho.net/open/gcn/homebrew-tap.git
 brew trust gutocarvalho/tap
 brew install brew-new
 ```
@@ -38,14 +38,14 @@ third-party tap until you trust it.
 It's a single Bash script. Drop it on your `PATH`:
 
 ```sh
-curl -fsSL https://gitlab.gutocarvalho.net/open/brew-new/-/raw/main/brew-new \
+curl -fsSL https://gitlab.gutocarvalho.net/open/gcn/brew-new/-/raw/main/brew-new \
   -o ~/.local/bin/brew-new && chmod +x ~/.local/bin/brew-new
 ```
 
 Or clone and symlink:
 
 ```sh
-git clone https://gitlab.gutocarvalho.net/open/brew-new.git
+git clone https://gitlab.gutocarvalho.net/open/gcn/brew-new.git
 ln -sf "$PWD/brew-new/brew-new" ~/.local/bin/brew-new
 ```
 
