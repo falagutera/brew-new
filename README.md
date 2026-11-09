@@ -121,6 +121,22 @@ Caches live under `${XDG_CACHE_HOME:-~/.cache}/brew-new` (tap clones refreshed
 every 6h, descriptions every 24h, GitHub licenses every 30 days; `--refresh`
 forces the clones and descriptions).
 
+## Testing and security
+
+GitLab CI ([`.gitlab-ci.yml`](.gitlab-ci.yml)) runs on every push and merge request; the shared
+security stage (from `open/gcn/ci-templates`) runs on `main` and on merge requests.
+
+- Blocking: `test` (the script parses, rejects a malformed period, and `--version` matches the
+  `VERSION` file), `changelog` (every version has its `CHANGELOG.md` entry), `gitleaks` (secrets
+  committed to the repository) and `trivy` (critical vulnerabilities with a fix, secrets and
+  misconfigurations).
+- Informative (reported, not blocking): `shellcheck` on `brew-new`, `semgrep`, `yamllint` and
+  `poutine` (security of the CI pipeline itself).
+
+Changing the code, by hand or with a coding agent? Read [AGENTS.md](AGENTS.md) first.
+
+Found a vulnerability? Please write to contato@gutocarvalho.net instead of opening a public issue.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

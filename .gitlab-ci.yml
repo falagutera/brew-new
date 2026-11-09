@@ -1,0 +1,35 @@
+include:
+  - project: 'open/gcn/ci-templates'
+    file: '/security.yml'
+    ref: main
+stages: [security, test]
+
+# Every VERSION needs its "## X.Y.Z" entry in CHANGELOG.md (the release notes).
+changelog:
+  stage: test
+  image: alpine:latest
+  script:
+    - V="$(tr -d '[:space:]' < VERSION)"
+    - P="$(printf '%s' "$V" | sed 's/[.]/[.]/g')"
+    - grep -Eq "^## \[?v?${P}([^0-9A-Za-z.]|$)" CHANGELOG.md || { echo "CHANGELOG.md has no '## $V' entry"; exit 1; }
+
+# The script parses, rejects a bad period, and its --version matches VERSION (the Homebrew
+# formula's test checks the same two things).
+test:
+  stage: test
+  image: alpine:latest
+  script:
+    - apk add --no-cache bash
+    - bash -n brew-new
+    - bash brew-new --help > /dev/null
+    - if bash brew-new bogus 2> err.txt; then echo "a bad period was accepted"; exit 1; fi
+    - grep -q "bad period" err.txt
+    - test "$(bash brew-new --version)" = "brew-new $(tr -d '[:space:]' < VERSION)" || { echo "VERSION= in brew-new does not match the VERSION file"; exit 1; }
+
+# The shared shellcheck job only looks at *.sh files; brew-new has no extension.
+shellcheck:
+  stage: test
+  image: {name: "koalaman/shellcheck-alpine:stable", entrypoint: [""]}
+  allow_failure: true
+  script:
+    - shellcheck brew-new
