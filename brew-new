@@ -181,6 +181,7 @@ rows=$(printf '%s' "$rows" | sed '/^$/d')
 
 # ---- GitHub license lookup for casks (only with --oss) ------------------------
 # Cache: "owner/repo<TAB>spdx<TAB>epoch"; spdx NONE = no repo/license, ? = lookup failed (not cached).
+# shellcheck disable=SC2329  # called through xargs + bash -c (export -f below)
 gh_license() { # owner/repo -> "owner/repo<TAB>spdx"; token comes via $BN_TOKEN, never argv
   local body code
   body=$(mktemp)
@@ -198,6 +199,7 @@ gh_license() { # owner/repo -> "owner/repo<TAB>spdx"; token comes via $BN_TOKEN,
   esac
   rm -f "$body"
 }
+# shellcheck disable=SC2329  # called by gh_license in the xargs subshell
 gh_license_text() { # owner/repo -> detected license or NOASSERTION
   local text
   text=$( { [ -n "${BN_TOKEN:-}" ] && printf 'header = "Authorization: Bearer %s"\n' "$BN_TOKEN"; } |
@@ -223,6 +225,7 @@ resolve_cask_licenses() { # $1 = rows file; cask col5 owner/repo -> SPDX id
     BN_TOKEN=${GITHUB_TOKEN:-${GH_TOKEN:-}}
     [ -z "$BN_TOKEN" ] && command -v gh >/dev/null && BN_TOKEN=$(gh auth token 2>/dev/null || true)
     export BN_TOKEN; export -f gh_license gh_license_text
+    # shellcheck disable=SC2016  # $1 expands inside the child bash, not here
     printf '%s\n' "$todo" | xargs -P 8 -I{} bash -c 'gh_license "$1"' _ {} > "$CACHE/.lic.new"
     if grep -q $'\t?$' "$CACHE/.lic.new"; then
       printf '%s: %s GitHub license lookup(s) failed (rate limit? set GITHUB_TOKEN); those casks are left out\n' \
@@ -275,7 +278,7 @@ case "$FORMAT" in
     echo "name,type,date,desc,license"
     printf '%s\n' "$rows" | awk -F'\t' 'NF{gsub(/"/,"\"\"",$4);print $1","$2","$3",\""$4"\","$5}' ;;
   names)
-    cols() { command -v column >/dev/null && column -c "${COLUMNS:-100}" || cat; }
+    cols() { if command -v column >/dev/null; then column -c "${COLUMNS:-100}"; else cat; fi; }
     [ "$WHICH" != casks ]    && { echo "==> New Formulae ($nf)"; printf '%s\n' "$rows" | awk -F'\t' '$2=="formula"{print $1}' | sort | cols; }
     [ "$WHICH" = all ]       && echo
     [ "$WHICH" != formulae ] && { echo "==> New Casks ($nc)"; printf '%s\n' "$rows" | awk -F'\t' '$2=="cask"{print $1}' | sort | cols; } ;;
