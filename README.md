@@ -20,6 +20,13 @@ tungsten-edge: Window-oriented taskbar that replaces the Dock
 ...
 ```
 
+## Contents
+
+- [Install](#install)
+- [Usage](#usage)
+- [How it works](#how-it-works)
+- [License](#license)
+
 ## Install
 
 ### Homebrew (tap)
