@@ -25,6 +25,7 @@ tungsten-edge: Window-oriented taskbar that replaces the Dock
 - [Install](#install)
 - [Usage](#usage)
 - [How it works](#how-it-works)
+- [Testing and security](#testing-and-security)
 - [License](#license)
 
 ## Install
